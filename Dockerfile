@@ -1,7 +1,7 @@
 FROM python:3.12-slim-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends apache2 apache2-dev gcc libpq-dev curl \
+    && apt-get install -y --no-install-recommends apache2 apache2-dev gcc libpq-dev curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,9 +20,9 @@ RUN mod_wsgi-express module-config > /etc/apache2/mods-available/wsgi.load \
 COPY apache/video_service.conf /etc/apache2/sites-available/video_service.conf
 RUN a2dissite 000-default && a2ensite video_service
 
-COPY web_service.py web_service.wsgi ./
+COPY web_service.py web_service.wsgi apply_zoom.py worker.py ./
 
-RUN mkdir -p /app/uploads && chown www-data:www-data /app/uploads
+RUN mkdir -p /app/uploads/zoomed && chown -R www-data:www-data /app/uploads
 
 EXPOSE 80
 CMD ["apache2ctl", "-D", "FOREGROUND"]

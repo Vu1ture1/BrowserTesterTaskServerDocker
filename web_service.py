@@ -1,17 +1,22 @@
 import hashlib
+import json
 import mimetypes
 import os
 import re
 import time
 
 import psycopg2
+from psycopg2.extras import Json
 from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
+
+import apply_zoom
 
 MAX_UPLOAD_BYTES = 1 << 30  # 1 GiB
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOADS_DIR = os.environ.get("UPLOAD_DIR") or os.path.join(BASE_DIR, "uploads")
+ZOOMED_SUBDIR = "zoomed"
 
 def required_env(name):
     value = os.environ.get(name)
@@ -56,7 +61,6 @@ def init_db(attempts=30, delay=2.0):
 
     try:
         with conn, conn.cursor() as cur:
-            # Several Apache processes may start at once; the lock lets only one create the table.
             cur.execute("SELECT pg_advisory_xact_lock(hashtext('videos_schema'))")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
@@ -67,6 +71,20 @@ def init_db(attempts=30, delay=2.0):
                     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
+            """)
+            cur.execute("""
+                ALTER TABLE videos
+                    ADD COLUMN IF NOT EXISTS zoom_events         JSONB,
+                    ADD COLUMN IF NOT EXISTS zoom_status         TEXT NOT NULL DEFAULT 'none',
+                    ADD COLUMN IF NOT EXISTS zoom_error          TEXT,
+                    ADD COLUMN IF NOT EXISTS zoom_started_at     TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS processed_file_path TEXT,
+                    ADD COLUMN IF NOT EXISTS processed_video_url TEXT,
+                    ADD COLUMN IF NOT EXISTS processed_at        TIMESTAMPTZ
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS videos_zoom_queue ON videos (updated_at)
+                WHERE zoom_status IN ('pending', 'processing')
             """)
     finally:
         conn.close()
@@ -80,10 +98,11 @@ def index():
     return jsonify(
         service="video upload service",
         endpoints=[
-            "POST /upload  (multipart: file, company_name)",
+            "POST /upload  (multipart: file, company_name, optional zoom = <video>.zoom.json)",
             "GET  /get_video_url?company_name=<name>",
             "GET  /media/<filename>",
             "GET  /videos",
+            "POST /jobs/<id>/process  (re-run the zoom processing)",
         ],
     )
 
@@ -96,6 +115,16 @@ def upload():
         return error(400, "Field 'company_name' is required.")
     if file is None:
         return error(400, "Field 'file' is required and must not be empty.")
+
+    zoom_events = None
+    zoom_file = request.files.get("zoom")
+    if zoom_file is not None:
+        try:
+            zoom_events = json.loads(zoom_file.read().decode("utf-8-sig"))
+            apply_zoom.parse_sidecar(zoom_events)
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
+            return error(400, "Field 'zoom' is not a valid zoom sidecar: {}".format(e))
+    zoom_status = "pending" if zoom_events is not None else "none"
 
     conn = get_db()
     try:
@@ -114,32 +143,53 @@ def upload():
 
         video_url = "{}media/{}".format(request.host_url, file_name)
 
+        zoom_json = Json(zoom_events) if zoom_events is not None else None
         with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT processed_file_path FROM videos WHERE company_name = %s FOR UPDATE",
+                (company_name,),
+            )
+            old = cur.fetchone()
             cur.execute(
                 """
                 UPDATE videos
-                SET file_path = %s, video_url = %s, updated_at = NOW()
+                SET file_path = %s, video_url = %s, updated_at = NOW(),
+                    zoom_events = %s, zoom_status = %s, zoom_error = NULL, zoom_started_at = NULL,
+                    processed_file_path = NULL, processed_video_url = NULL, processed_at = NULL
                 WHERE company_name = %s
                 """,
-                (file_path, video_url, company_name),
+                (file_path, video_url, zoom_json, zoom_status, company_name),
             )
             if cur.rowcount == 0:
                 cur.execute(
                     """
-                    INSERT INTO videos (company_name, file_path, video_url)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO videos (company_name, file_path, video_url, zoom_events, zoom_status)
+                    VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (company_name) DO UPDATE SET
-                        file_path  = EXCLUDED.file_path,
-                        video_url  = EXCLUDED.video_url,
-                        updated_at = NOW()
+                        file_path   = EXCLUDED.file_path,
+                        video_url   = EXCLUDED.video_url,
+                        zoom_events = EXCLUDED.zoom_events,
+                        zoom_status = EXCLUDED.zoom_status,
+                        updated_at  = NOW()
                     """,
-                    (company_name, file_path, video_url),
+                    (company_name, file_path, video_url, zoom_json, zoom_status),
                 )
     finally:
         conn.close()
 
-    app.logger.info("Uploaded %s -> %s", company_name, file_path)
-    return jsonify(company_name=company_name, video_url=video_url)
+    if old and old[0] and os.path.exists(old[0]):
+        try:
+            os.remove(old[0])
+        except OSError:
+            pass
+
+    app.logger.info("Uploaded %s -> %s (zoom: %s)", company_name, file_path, zoom_status)
+    return jsonify(
+        company_name=company_name,
+        video_url=video_url,
+        zoom_status=zoom_status,
+        processed_video_url=None,
+    )
 
 @app.get("/get_video_url")
 def get_video_url():
@@ -150,18 +200,56 @@ def get_video_url():
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT video_url FROM videos WHERE company_name = %s", (company_name,))
+            cur.execute(
+                """
+                SELECT video_url, zoom_status, processed_video_url, zoom_error
+                FROM videos WHERE company_name = %s
+                """,
+                (company_name,),
+            )
             row = cur.fetchone()
     finally:
         conn.close()
 
     if row is None:
         return error(404, "Company '{}' not found.".format(company_name))
-    return jsonify(company_name=company_name, video_url=row[0])
+    result = {
+        "company_name": company_name,
+        "video_url": row[0],
+        "zoom_status": row[1],
+        "processed_video_url": row[2],
+    }
+    if row[3]:
+        result["zoom_error"] = row[3]
+    return jsonify(result)
 
-@app.get("/media/<filename>")
+@app.post("/jobs/<int:video_id>/process")
+def process_job(video_id):
+    """Queue the zoom processing again (e.g. after a failure); the worker picks it up."""
+    conn = get_db()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT zoom_events IS NOT NULL, zoom_status FROM videos WHERE id = %s FOR UPDATE",
+                (video_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return error(404, "Video {} not found.".format(video_id))
+            if not row[0]:
+                return error(409, "Video {} has no zoom events; upload it with a 'zoom' sidecar.".format(video_id))
+            if row[1] == "processing":
+                return error(409, "Video {} is being processed.".format(video_id))
+            cur.execute(
+                "UPDATE videos SET zoom_status = 'pending', zoom_error = NULL WHERE id = %s",
+                (video_id,),
+            )
+    finally:
+        conn.close()
+    return jsonify(id=video_id, zoom_status="pending"), 202
+
+@app.get("/media/<path:filename>")
 def media(filename):
-    # Under Apache /media/ is served by Apache itself (Alias), so this route is used only by `python web_service.py`.
     if filename.endswith(".part"):
         return error(404, "File not found.")
     return send_from_directory(UPLOADS_DIR, filename, conditional=True)
@@ -173,7 +261,8 @@ def videos():
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, company_name, file_path, video_url, created_at, updated_at
+                SELECT id, company_name, file_path, video_url, created_at, updated_at,
+                       zoom_status, processed_video_url, zoom_error
                 FROM videos ORDER BY id
                 """
             )
@@ -189,6 +278,9 @@ def videos():
             "video_url": row[3],
             "created_at": row[4].isoformat(),
             "updated_at": row[5].isoformat(),
+            "zoom_status": row[6],
+            "processed_video_url": row[7],
+            "zoom_error": row[8],
         }
         for row in rows
     ])

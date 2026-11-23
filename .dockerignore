@@ -4,3 +4,5 @@ uploads/
 videos.db*
 .env
 .git/
+.pytest_cache/
+tests/

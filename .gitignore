@@ -1,10 +1,9 @@
 .venv*/
 __pycache__/
 
-# Runtime data of the video service
 uploads/
 videos.db
 videos.db-*
 
-# Secrets
 .env
+.pytest_cache/
