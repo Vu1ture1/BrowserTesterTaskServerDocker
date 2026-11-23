@@ -182,15 +182,23 @@ def test_zoomed_frames_differ_from_original(company, sample_video):
     result = wait_for(company)
     assert result["zoom_status"] == "done", result
 
-    def frame_md5(path, t):
-        return compose("exec", "-T", "worker", "ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
-                       "-frames:v", "1", "-f", "md5", "-")
-
     original = media_path(result["video_url"])
     zoomed = media_path(result["processed_video_url"])
-    assert frame_md5(original, 0.1) == frame_md5(zoomed, 0.1)   # before the first zoom: unchanged
-    assert frame_md5(original, 1.5) != frame_md5(zoomed, 1.5)   # zoomed in
-    assert frame_md5(original, 3.8) != frame_md5(zoomed, 3.8)   # open-ended zoom holds to the end
+
+    def similarity(t):
+        """SSIM of the original and the zoomed frame at t (1.0 = identical). Re-encoding is lossy,
+        so an unzoomed frame is close to 1 but not bit-identical."""
+        out = subprocess.run(
+            ["docker", "compose", "--project-directory", PROJECT_DIR, "exec", "-T", "worker",
+             "ffmpeg", "-hide_banner", "-ss", str(t), "-i", original, "-ss", str(t), "-i", zoomed,
+             "-frames:v", "1", "-lavfi", "[0:v][1:v]ssim", "-f", "null", "-"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        ).stderr
+        return float(out.split(" All:")[1].split()[0])
+
+    assert similarity(0.1) > 0.9
+    assert similarity(1.5) < 0.7
+    assert similarity(3.8) < 0.7
 
 def test_sidecar_without_events_is_copied_unchanged(company, sample_video):
     upload(company, sample_video, {"events": []})
